@@ -23,63 +23,68 @@ def get_pi_idx(pis, threshold):
     print('pdf {} thresh {}'.format(pdf, threshold))
     return idx
 
+def set_random_params(self, stdev=0.5):
+        params = self.get_weights()
+        rand_params = []
+        for param_i in params:
+            # David's spicy initialization scheme is wild but from preliminary experiments is critical
+            sampled_param = np.random.standard_cauchy(param_i.shape)*stdev / 10000.0
+            rand_params.append(sampled_param) # spice things up
 
-class MLP(tf.keras.Model):
-    """ used for testing only """
-    def __init__(self, num_mix, hidden_nodes):
-        super().__init__()
-        self.perceptron = tf.keras.Sequential(
-            [tf.keras.layers.Dense(
-                24,
-                dtype='float32',
-                activation='tanh',
-                kernel_initializer=tf.initializers.RandomNormal(stddev=0.5)
-            ),
-             tf.keras.layers.Dense(num_mix * 3, dtype='float32')
-            ]
-        )
+        self.set_weights(rand_params)
 
-    def __call__(self, input_tensor):
-        return self.perceptron(input_tensor)
+# class MLP(tf.keras.Model):
+#     """ used for testing only """
+#     def __init__(self, num_mix, hidden_nodes):
+#         super().__init__()
+#         self.perceptron = tf.keras.Sequential(
+#             [tf.keras.layers.Dense(
+#                 24,
+#                 dtype='float32',
+#                 activation='tanh',
+#                 kernel_initializer=tf.initializers.RandomNormal(stddev=0.5)
+#             ),
+#              tf.keras.layers.Dense(num_mix * 3, dtype='float32')
+#             ]
+#         )
+#
+#     def __call__(self, input_tensor):
+#         return self.perceptron(input_tensor)
+#
 
-
-class LSTM():
-    """ car racing defaults """
+class LSTM(tf.keras.Model):
+    """ create a custom LSTM cell layer for framewise processing """
+    # init in Memory: mixture_dim = 32 (output_dim) * 5 (num_mix) * 3 (len([pi,mu,sigma]))
+    # self.lstm = LSTM(input_dim,mixture_dim,num_timesteps,batch_size,lstm_nodes)
     def __init__(
             self,
-            input_dim,
-            output_dim,
-            num_timesteps,
-            batch_size,
-            nodes
-    ):
-        self.input_dim = input_dim
-        self.nodes = nodes
-        self.batch_size = batch_size
+            input_dim, # 32 (latents) + 3 (actions) = 35
+            num_mdn_inputs, # 480 (mixture_dim)
+            num_timesteps, # 999
+            batch_size, # 100
+            num_units # lstm_nodes = 256
+            ):
+        super(LSTM, self).__init__()
 
-        input_layer = tf.keras.Input(shape=(num_timesteps, input_dim), batch_size=batch_size)
+        self.input_dim = input_dim # latent_dim + num_actions = 35
+        self.num_units = num_units # 256
+        self.batch_size = batch_size # 100
 
-        cell = tf.keras.layers.LSTMCell(
-            nsodes,
+        self.cell = tf.keras.layers.LSTMCell(
+            self.num_units,
             kernel_initializer='glorot_uniform',
             recurrent_initializer='glorot_uniform',
-            bias_initializer='zeros',
-        )
+            bias_initializer='zeros')
 
         self.lstm = tf.keras.layers.RNN(
-            cell,
-            return_state=True,
-            return_sequences=True,
-            stateful=False
-        )
+            self.cell,
+            return_state=True, # return (hidden and cell) states at every timestep (= next LSTM input)
+            return_sequences=True, # return output (= MDN input) at every timestep
+            stateful=False)
 
-        lstm_out, hidden_state, cell_state = self.lstm(input_layer)
-        output = tf.keras.layers.Dense(output_dim)(lstm_out)
-
-        self.net = tf.keras.Model(inputs=input_layer, outputs=[output, hidden_state, cell_state])
+        self.output_layer = tf.keras.layers.Dense(num_mdn_inputs)
 
     def get_zero_hidden_state(self, inputs):
-        #  inputs dont matter here - but batch size does!
         return [
             tf.zeros((inputs.shape[0], self.nodes)),
             tf.zeros((inputs.shape[0], self.nodes))
@@ -88,79 +93,28 @@ class LSTM():
     def get_initial_state(self, inputs):
         return self.initial_state
 
-    def __call__(self, inputs, state):
+    def call(self, input, state):
         self.initial_state = state
         self.lstm.get_initial_state = self.get_initial_state
-        return self.net(inputs)
+        lstm_out, hidden_state, cell_state = self.lstm(input)
+        output = self.output_layer(lstm_out)
+        return output, hidden_state, cell_state
 
-
-class GaussianMixture(tf.keras.Model):
-    def __init__(self, num_features, num_mix, num_timesteps, batch_size):
-        self.num_mix = num_mix
-
-        #  (batch_size, num_timesteps, output_dim * num_mix * 3)
-        #  3 = one pi, mu, sigma for each mixture
-        mixture_dim = num_features * num_mix * 3
-
-        input_layer = tf.keras.Input(shape=(num_timesteps, mixture_dim), batch_size=batch_size)
-
-        #  (batch, time, num_features, num_mix * 3)
-        expand = tf.reshape(input_layer, (-1, num_timesteps, num_features, num_mix * 3))
-
-        #  (batch, time, num_features, num_mix)
-        pi, mu, sigma = tf.split(expand, 3, axis=3)
-
-        #  softmax the pi's (alpha in Bishop 1994)
-        pi = tf.exp(tf.subtract(tf.reduce_max(pi, 3, keepdims=True), pi))
-        pi = tf.divide(pi, tf.reduce_sum(pi, 3, keepdims=True))
-
-        sigma = tf.maximum(sigma, 1e-8)
-        sigma = tf.exp(sigma)
-
-        super().__init__(inputs=[input_layer], outputs=[pi, mu, sigma])
-
-    def kernel_probs(self, mu, sigma, next_latent):
-        constant = 1 / math.sqrt(2 * math.pi)
-
-        #  mu.shape
-        #  (batch_size, num_timesteps, num_features, num_mix)
-
-        #  next_latent.shape
-        #  (batch_size, num_timesteps, num_features)
-        #  -> (batch_size, num_timesteps, num_features, num_mix)
-        next_latent = tf.expand_dims(next_latent, axis=-1)
-        next_latent = tf.tile(next_latent, (1, 1, 1, self.num_mix))
-
-        gaussian_kernel = tf.subtract(next_latent, mu)
-        gaussian_kernel = tf.square(tf.divide(gaussian_kernel, sigma))
-        gaussian_kernel = - 1/2 * gaussian_kernel
-        conditional_probabilities = tf.divide(tf.exp(gaussian_kernel), sigma) * constant
-
-        #  (batch_size, num_timesteps, num_features, num_mix)
-        return conditional_probabilities
-
-    def get_loss(self, mixture, next_latent):
-        pi, mu, sigma = self(mixture)
-        probs = self.kernel_probs(mu, sigma, next_latent)
-        loss = tf.multiply(probs, pi)
-
-        #  reduce along the mixes
-        loss = tf.reduce_sum(loss, 3, keepdims=True)
-        loss = -tf.math.log(loss)
-        loss = tf.reduce_mean(loss)
-        return loss
-
-
+"""
+The memory predicts how the environment will change based on the last action that has been taken.
+We will use the hidden state h of the LSTM to train a Controller.
+This internal representation is a compressed representation of time containing information the memory has learnt as being useful to predict the future.
+"""
 class Memory:
-    """ initializes LSTM and Mixture models """
+    """ combines LSTM and Gaussian Mixed Density model to generate predictions of future states based on timestep-data history """
     def __init__(
             self,
-            input_dim=35,
-            output_dim=32,
-            num_timesteps=999,
-            batch_size=100,
+            input_dim=35, # length of latent input vector (latent code of current state observation + action values)
+            latent_dim=32, # length of latent output vector (latent code of next state observation)
+            num_timesteps=999, # over how many timesteps to train
+            batch_size=100, # number of items in batch
             lstm_nodes=256,
-            num_mix=5,
+            num_mixtures=5, # number of Gaussian distributed RVs to model pdf over latent output
             grad_clip=1.0,
             initial_learning_rate=0.001,
             end_learning_rate=0.00001,
@@ -171,10 +125,12 @@ class Memory:
     ):
         decay_steps = epochs * batch_per_epoch
         self.input_dim = input_dim
-        self.output_dim = output_dim
+        self.latent_dim = latent_dim
         self.batch_size = batch_size
 
-        mixture_dim = output_dim * num_mix * 3
+        # how many values to regress as input to Mixture Density network
+        # 3 (pi, mu, sigma) for each mixture RV for each latent code dimension
+        mixture_dim = latent_dim * num_mixtures * 3
 
         self.lstm = LSTM(
             input_dim,
@@ -184,13 +140,8 @@ class Memory:
             lstm_nodes
         )
 
-        self.mixture = GaussianMixture(
-            output_dim,
-            num_mix,
-            num_timesteps,
-            batch_size
-        )
-
+        # decay learning rate after decay_steps updates during training
+        # until minimum of end_learning_rate is reached
         learning_rate = tf.keras.optimizers.schedules.PolynomialDecay(
             initial_learning_rate=initial_learning_rate,
             decay_steps=decay_steps,
@@ -198,17 +149,111 @@ class Memory:
         )
 
         self.optimizer = tf.keras.optimizers.Adam(learning_rate, clipvalue=grad_clip)
-
+        # dict to save and load model parameters with corresponding model names
         self.models = {
-            'lstm': self.lstm.net,
-            'gaussian-mix': self.mixture
+            'lstm': self.lstm,
+            'gaussian-mix': self.mdn
         }
-
+        # use saved weights for models
         if load_model:
             self.load(results_dir)
 
+    def call(self, input, state, temperature, threshold=None):
+        """ forward pass to generate prediction of y at every timestep """
+        input = tf.reshape(input, (1, 1, self.input_dim))
+        temperature = np.array(temperature).reshape(1, 1)
+        lstm_out, h_state, c_state = self.lstm(input, state)
+
+        # input param of shape (batch_size, num_timesteps, latent_dim * num_mixtures * 3)
+        # rehape into (batch_size, num_timesteps, latent_dim, num_mixtures * 3)
+        output = tf.reshape(lstm_out, -1, (lstm_out.shape[0],lstm_out.shape[1], latent_dim, num_mixtures*3))
+
+        # mixture density network layer computations
+        # get pi, mu, sigma each of shape (batch_size, num_timesteps, latent_dim, num_mixtures)
+        # pi, mu, sigma = tf.split(hidden_layer_output, 3, axis=3)
+        pi, mu, sigma = tf.split(input, 3, axis=3)
+        # softmax the pi's to ensure each distribution sums up to one
+        pi = tf.keras.activations.softmax(pi)
+        sigma = tf.exp(tf.maximum(sigma, 1e-8))
+
+        #  for a single sample, single timtestep
+        pi = np.array(pi).reshape(self.output_dim, pi.shape[3])
+        mu = np.array(mu).reshape(self.output_dim, mu.shape[3])
+        sigma = np.array(sigma).reshape(self.output_dim, sigma.shape[3])
+
+        #  reset values every forward pass
+        idxs = np.zeros(self.output_dim)
+        mus = np.zeros(self.output_dim)
+        sigmas = np.zeros(self.output_dim)
+        # initialize latent vector (=to be predicted) with 0 values
+        next_latent_pred = np.zeros(self.output_dim)
+
+        # compute next latent code prediction based on output of lstm-mdn-processed input
+        for num in range(self.output_dim):
+            idx = get_pi_idx(pi[num, :], threshold=threshold)
+            idxs[num] = idx
+            mus[num] = mu[num, idx]
+            sigmas[num] = sigma[num, idx]
+
+            next_latent_pred[num] = mus[num] + np.random.randn() * sigmas[num] * np.sqrt(temperature)
+
+        return next_latent_pred, h_state, c_state
+
+    def kernel_probs(self, mu, sigma, next_latent):
+        constant = 1 / math.sqrt(2 * math.pi)
+        #  mu.shape
+        #  (batch_size, num_timesteps, num_features, num_mix)
+
+        #  next_latent.shape
+        #  (batch_size, num_timesteps, num_features)
+        #  -> (batch_size, num_timesteps, num_features, num_mixtures)
+        next_latent = tf.expand_dims(next_latent, axis=-1)
+        next_latent = tf.tile(next_latent, (1, 1, 1, self.num_mixtures))
+
+        gaussian_kernel = tf.subtract(next_latent, mu)
+        gaussian_kernel = tf.square(tf.divide(gaussian_kernel, sigma))
+        gaussian_kernel = - 1/2 * gaussian_kernel
+        conditional_probabilities = tf.divide(tf.exp(gaussian_kernel), sigma) * constant
+
+        #  (batch_size, num_timesteps, num_features, num_mix)
+        return conditional_probabilities
+
+    def get_loss(self, lstm_out, next_latent):
+        # input param of shape (batch_size, num_timesteps, latent_dim * num_mixtures * 3)
+        # rehape into (batch_size, num_timesteps, latent_dim, num_mixtures * 3)
+        output = tf.reshape(lstm_out, -1, (lstm_out.shape[0],lstm_out.shape[1], latent_dim, num_mixtures*3))
+
+        # mixture density network layer computations
+        # get pi, mu, sigma each of shape (batch_size, num_timesteps, latent_dim, num_mixtures)
+        # pi, mu, sigma = tf.split(hidden_layer_output, 3, axis=3)
+        pi, mu, sigma = tf.split(input, 3, axis=3)
+        # softmax the pi's to ensure each distribution sums up to one
+        pi = tf.keras.activations.softmax(pi)
+        sigma = tf.exp(tf.maximum(sigma, 1e-8))
+
+        # compute next latent code probabilities
+        probs = self.kernel_probs(mu, sigma, next_latent)
+        loss = tf.multiply(probs, pi)
+
+        #  reduce along the mixes
+        loss = tf.reduce_sum(loss, 3, keepdims=True)
+        loss = -tf.math.log(loss)
+        loss = tf.reduce_mean(loss)
+        return loss
+
+    def train_op(self, input, target, state):
+        """ update network parameters via backpropagation """
+        with tf.GradientTape() as tape:
+            lstm_out, _, _ = self.lstm(input, state)
+            loss = self.get_loss(lstm_out, target)
+            # we only get gradients for the lstm because the mdn has no trainable variables (layers)
+            # i.e. we could also completely integrate it into the memory model instead of having it as a separate model as now
+            gradients = tape.gradient(loss, self.lstm.trainable_variables)
+            self.optimizer.apply_gradients(zip(gradients, self.lstm.trainable_variables))
+        return loss
+
     def save(self, filepath):
-        """ only model weights """
+        """ save model weights """
         filepath = os.path.join(filepath, 'models')
         os.makedirs(filepath, exist_ok=True)
         print('saving model to {}'.format(filepath))
@@ -216,63 +261,10 @@ class Memory:
             model.save_weights('{}/{}.h5'.format(filepath, name))
 
     def load(self, filepath):
-        """ only model weights """
+        """ load model weights from storage """
         filepath = os.path.join(filepath, 'models')
         print('loading model from {}'.format(filepath))
 
         for name, model in self.models.items():
             model.load_weights('{}/{}.h5'.format(filepath, name))
             self.models[name] = model
-
-    def __call__(self, x, state, temperature, threshold=None):
-        """
-        forward pass
-        hardcoded for a single step - because we want to pass state
-        inbetween
-        """
-        x = tf.reshape(x, (1, 1, self.input_dim))
-        assert x.shape[0] == 1
-
-        temperature = np.array(temperature).reshape(1, 1)
-        assert temperature.shape[0] == x.shape[0]
-
-        mixture, h_state, c_state = self.lstm(x, state)
-
-        pi, mu, sigma = self.mixture(mixture) #, temperature
-
-        #  single sample, single timtestep
-        pi = np.array(pi).reshape(self.output_dim, pi.shape[3])
-        mu = np.array(mu).reshape(self.output_dim, mu.shape[3])
-        sigma = np.array(sigma).reshape(self.output_dim, sigma.shape[3])
-
-        #  reset every forward pass
-        idxs = np.zeros(self.output_dim)
-        mus = np.zeros(self.output_dim)
-        sigmas = np.zeros(self.output_dim)
-        y = np.zeros(self.output_dim)
-
-        for num in range(self.output_dim):
-            idx = get_pi_idx(pi[num, :], threshold=threshold)
-
-            idxs[num] = idx
-            mus[num] = mu[num, idx]
-            sigmas[num] = sigma[num, idx]
-
-            y[num] = mus[num] + np.random.randn() * sigmas[num] * np.sqrt(temperature)
-
-        #  check no zeros in pis
-        assert sum(idxs) > 0
-
-        return y, h_state, c_state
-
-    def train_op(self, x, y, state):
-        """ backward pass """
-        with tf.GradientTape() as tape:
-            out, _, _ = self.lstm(x, state)
-            loss = self.mixture.get_loss(out, y)
-            gradients = tape.gradient(loss, self.lstm.net.trainable_variables)
-
-        self.optimizer.apply_gradients(
-            zip(gradients, self.lstm.net.trainable_variables)
-        )
-        return loss
