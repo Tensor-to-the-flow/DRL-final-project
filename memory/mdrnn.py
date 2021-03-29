@@ -246,8 +246,6 @@ class Memory:
         with tf.GradientTape() as tape:
             lstm_out, _, _ = self.lstm(input, state)
             loss = self.get_loss(lstm_out, target)
-            # we only get gradients for the lstm because the mdn has no trainable variables (layers)
-            # i.e. we could also completely integrate it into the memory model instead of having it as a separate model as now
             gradients = tape.gradient(loss, self.lstm.trainable_variables)
             self.optimizer.apply_gradients(zip(gradients, self.lstm.trainable_variables))
         return loss
